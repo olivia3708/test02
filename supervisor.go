@@ -4,7 +4,6 @@ package main
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -154,8 +153,6 @@ type ghReleaseItem struct {
 	TagName string `json:"tag_name"`
 }
 
-// resolveLatestTagViaRedirect resolves the latest release tag via GitHub's standard 302 web
-// redirect (/releases/latest -> /releases/tag/vX.Y.Z), which never consumes api.github.com rate limits.
 func resolveLatestTagViaRedirect() string {
 	noRedirectClient := &http.Client{
 		Timeout: 12 * time.Second,
@@ -213,8 +210,6 @@ func resolveLatestWorkerTag(client *http.Client, apiURL string) string {
 	return ""
 }
 
-// streamWorkerArchiveToFile downloads the release archive directly to a temporary file on disk
-// using a small 32 KiB buffer while computing its SHA-256 digest on the fly, avoiding any RAM spike.
 func streamWorkerArchiveToFile(client *http.Client, baseDir, zipURL, dgstURL string) (string, int64, error) {
 	reqZip, err := http.NewRequest(http.MethodGet, zipURL, nil)
 	if err != nil {
@@ -416,15 +411,12 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 		}
 	}
 
-	// Tier 1: Direct GitHub /releases/latest/download/ redirect (never hits api.github.com rate limit)
 	addCandidate("latest-redirect", latestBaseURL+archiveName)
 
-	// Tier 2: Tag resolved via /releases/latest Location header or API
 	if resolvedTag := resolveLatestWorkerTag(client, apiURL); resolvedTag != "" {
 		addCandidate(resolvedTag, baseURL+resolvedTag+"/"+archiveName)
 	}
 
-	// Tier 3: Known verified stable release tags
 	for _, tag := range fallbackWorkerTags {
 		addCandidate(tag, baseURL+tag+"/"+archiveName)
 	}
@@ -1722,9 +1714,6 @@ func (s *Supervisor) Snapshot() SupervisorHealthSnapshot {
 	wsOK := state&healthWS != 0
 	trOK := state&healthTR != 0
 
-	// During the initial worker archive bootstrap window on fresh container boot,
-	// report healthy to Kubernetes/Traefik readiness probes so the Pod is immediately
-	// added to Service endpoints (`subsets`) while background extraction completes.
 	if !ready && !s.stopRequested.Load() && s.bootstrapping.Load() && time.Since(s.createdAt) < bootstrapGraceWindow {
 		running = true
 		ready = true
