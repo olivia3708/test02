@@ -386,6 +386,53 @@ func (g *Gateway) SetInfrastructureDomains(seenodeDom, cfDom, reg string) {
 	g.domainMu.Unlock()
 }
 
+// observeRequestHost passively learns the Seenode public service domain (e.g. "test02.seenode.app")
+// or custom domain from the first incoming request's Host header in nanoseconds.
+func (g *Gateway) observeRequestHost(reqHost string) {
+	if g == nil || reqHost == "" {
+		return
+	}
+	g.domainMu.RLock()
+	hasSN := isFullSeenodeServiceDomain(g.seenodeDomain)
+	hasCF := g.cloudflareDomain != ""
+	sn := g.sn
+	cf := g.cf
+	g.domainMu.RUnlock()
+
+	if hasSN && hasCF {
+		return
+	}
+
+	clean := cleanHost(reqHost)
+	if isLocalLoopbackHost(clean) {
+		return
+	}
+
+	if isSeenodePublicDomain(clean) && !hasSN {
+		g.SetInfrastructureDomains(clean, "", "")
+		if g.sup != nil {
+			g.sup.SetInfrastructureDomains(clean, "", "")
+		}
+		if cf != nil {
+			cf.SetSeenodeOrigin(clean)
+		}
+		if sn != nil {
+			sn.SetServiceDomain(clean)
+		}
+	} else if !isSeenodeManagedDomain(clean) && !hasCF {
+		g.SetInfrastructureDomains("", clean, "")
+		if g.sup != nil {
+			g.sup.SetInfrastructureDomains("", clean, "")
+		}
+		if cf != nil {
+			cf.SetPreferredDomain(clean)
+		}
+		if sn != nil {
+			sn.SetCustomDomain(clean)
+		}
+	}
+}
+
 func extractClientIP(h http.Header) string {
 	if cfIP := strings.TrimSpace(h.Get("CF-Connecting-IP")); cfIP != "" {
 		return cfIP
@@ -1016,6 +1063,7 @@ func (g *Gateway) servePortalPanel(w http.ResponseWriter, r *http.Request, setCo
 func (g *Gateway) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g.totalReq.Add(1)
+		g.observeRequestHost(r.Host)
 
 		if r.URL.RawQuery != "" {
 			q := r.URL.Query()
