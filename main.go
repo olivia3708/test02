@@ -28,7 +28,7 @@ const (
 	httpDrainTimeout          = 8 * time.Second
 	edgeKeepAlivePeriod       = 15 * time.Second
 	drainPropagationWindow    = 450 * time.Millisecond
-	startupOrchestrationDelay = 8 * time.Second
+	startupOrchestrationDelay = 4 * time.Second
 	dnsPropagationSettleDelay = 4 * time.Second
 	tcpUserTimeoutOpt         = 18
 )
@@ -67,13 +67,13 @@ func deriveMemoryBudget() (gwMB, workerMB int) {
 
 		// Cap combined soft ceiling at <= 68% of container RAM to prevent OOM-Kill (Exit 137)
 		allowedMB := totalMB * 68 / 100
-		if gwMB < 32 {
-			gwMB = 32
+		if gwMB < 48 {
+			gwMB = 48
 		}
 		if workerMB < 64 {
 			workerMB = 64
 		}
-		if total := gwMB + workerMB; total > allowedMB && allowedMB >= 96 {
+		if total := gwMB + workerMB; total > allowedMB && allowedMB >= 112 {
 			gwMB = allowedMB * gatewayMemPercent / 68
 			workerMB = allowedMB * workerMemPercent / 68
 		}
@@ -85,6 +85,9 @@ func deriveMemoryBudget() (gwMB, workerMB int) {
 }
 
 func applyMemoryCeiling(selfMB int) {
+	if selfMB < 48 {
+		selfMB = 48
+	}
 	debug.SetMemoryLimit(int64(selfMB) << 20)
 	debug.SetGCPercent(100)
 }
@@ -267,7 +270,7 @@ func orchestrateCloudInfrastructure(
 	initialCF string,
 	region string,
 ) {
-	for i := 0; i < 40 && !sup.IsReady(); i++ {
+	for i := 0; i < 120 && !sup.IsReady(); i++ {
 		if !sleepContext(ctx, 250*time.Millisecond) {
 			return
 		}
@@ -484,13 +487,24 @@ func watchAndPromoteCustomDomain(
 func bindDualListeners(listenCfg *net.ListenConfig, primaryPort string) ([]net.Listener, []string, error) {
 	strictMode := strings.EqualFold(getEnv("BERMUDA_STRICT_PORT", "false"), "true")
 
-	portsToTry := []string{primaryPort}
-	if !strictMode {
-		if primaryPort != compatSeenodeDefaultPort {
-			portsToTry = append(portsToTry, compatSeenodeDefaultPort)
-		} else {
-			portsToTry = append(portsToTry, defaultPort)
+	seenPorts := make(map[string]struct{}, 4)
+	var portsToTry []string
+	addPort := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
 		}
+		if _, exists := seenPorts[p]; !exists {
+			seenPorts[p] = struct{}{}
+			portsToTry = append(portsToTry, p)
+		}
+	}
+
+	addPort(primaryPort)
+	if !strictMode {
+		addPort(defaultPort)
+		addPort(compatSeenodeDefaultPort)
+		addPort("3000")
 	}
 
 	var listeners []net.Listener
@@ -506,9 +520,7 @@ func bindDualListeners(listenCfg *net.ListenConfig, primaryPort string) ([]net.L
 				if strictMode {
 					return nil, nil, err
 				}
-				log.Printf("[Gateway] Notice: Primary port :%s unavailable (%v); attempting compatibility port...", p, err)
-			} else {
-				log.Printf("[Gateway] Notice: Optional compatibility port :%s not bound (%v); continuing on bound listener", p, err)
+				log.Printf("[Gateway] Notice: Primary port :%s unavailable (%v); binding compatibility ports...", p, err)
 			}
 			continue
 		}
@@ -579,16 +591,16 @@ func teardown(
 }
 
 func main() {
+	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	log.Println("[Gateway] Initializing BERMUDA PORTAL Edge Router (Seenode + Cloudflare Edition)...")
 
 	gwMB, workerMB := deriveMemoryBudget()
-	applyMemoryCeiling(gwMB)
 	procs := applyGOMAXPROCS()
 
 	_ = syscall.Setenv("BERMUDA_WORKER_MEM_MB", strconv.Itoa(workerMB))
 	_ = syscall.Setenv("BERMUDA_WORKER_GOMAXPROCS", strconv.Itoa(procs))
-	log.Printf("[Runtime] Resource limits configured: Gateway=%dMiB, Worker=%dMiB (GOGC=100) | GOMAXPROCS=%d",
+	log.Printf("[Runtime] Resource budget calibrated: Gateway=%dMiB, Worker=%dMiB (GOGC=100) | GOMAXPROCS=%d",
 		gwMB, workerMB, procs)
 
 	sigCtx, stopSig := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -600,10 +612,9 @@ func main() {
 	rawRegion := getEnv("BERMUDA_REGION", getEnv("SEENODE_REGION", getEnv("REGION", "")))
 	region := normalizeRegion(rawRegion)
 
+	// NewSupervisor initializes credentials, in-memory config, and subreaper in <1ms without
+	// blocking on network I/O, allowing HTTP listeners to bind immediately on container boot.
 	sup := NewSupervisor()
-	if err := sup.PreflightContext(sigCtx); err != nil {
-		log.Printf("[Gateway] Notice: Preflight check: %v", err)
-	}
 
 	cfToken := sanitizeCloudflareToken(getEnv("CLOUDFLARE_API_TOKEN", getEnv("BERMUDA_CF_API_TOKEN", "")))
 	cfZoneID := sanitizeExplicitCredential(getEnv("CLOUDFLARE_ZONE_ID", getEnv("BERMUDA_CF_ZONE_ID", "")))
@@ -660,12 +671,6 @@ func main() {
 		sn.SetTopologyCallback(topologyUpdater)
 	}
 
-	supCtx, supCancel := context.WithCancel(context.Background())
-	supErrCh := make(chan error, 1)
-	go func() {
-		supErrCh <- sup.Run(supCtx)
-	}()
-
 	srv := &http.Server{
 		Addr:              "0.0.0.0:" + port,
 		Handler:           gw.Handler(),
@@ -685,19 +690,15 @@ func main() {
 			Count:    4,
 		},
 		Control: func(network, address string, c syscall.RawConn) error {
-			var controlErr error
-			err := c.Control(func(fd uintptr) {
-				if e := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpUserTimeoutOpt, 90000); e != nil {
-					controlErr = e
-				}
+			_ = c.Control(func(fd uintptr) {
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpUserTimeoutOpt, 90000)
 			})
-			if err != nil {
-				return err
-			}
-			return controlErr
+			return nil
 		},
 	}
 
+	// Bind HTTP listeners FIRST before starting worker bootstrap so Kubernetes/Traefik
+	// immediately registers the Pod endpoint in `customers/web-*-service` subsets.
 	listeners, boundAddrs, err := bindDualListeners(&listenCfg, port)
 	if err != nil {
 		log.Fatalf("[Gateway] Fatal: Cannot bind HTTP listener on :%s: %v", port, err)
@@ -718,6 +719,24 @@ func main() {
 			}
 		}()
 	}
+
+	supCtx, supCancel := context.WithCancel(context.Background())
+	supErrCh := make(chan error, 1)
+	go func() {
+		supErrCh <- sup.Run(supCtx)
+	}()
+
+	// Apply tight gateway memory ceiling after initial worker bootstrap finishes
+	go func() {
+		select {
+		case <-sup.BootstrapDone():
+		case <-sigCtx.Done():
+			return
+		}
+		runtime.GC()
+		debug.FreeOSMemory()
+		applyMemoryCeiling(gwMB)
+	}()
 
 	cloudCtx, cloudCancel := context.WithCancel(sigCtx)
 	defer cloudCancel()
