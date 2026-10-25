@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -46,6 +47,19 @@ type cfAPIError struct {
 
 func (e *cfAPIError) Error() string {
 	return fmt.Sprintf("cloudflare api error (HTTP %d): %+v", e.StatusCode, e.Errors)
+}
+
+func (e *cfAPIError) IsInvalidToken() bool {
+	for _, msg := range e.Errors {
+		if msg.Code == 9109 || msg.Code == 6003 || msg.Code == 9106 {
+			return true
+		}
+		lower := strings.ToLower(msg.Message)
+		if strings.Contains(lower, "invalid access token") || strings.Contains(lower, "invalid request headers") {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *cfAPIError) IsPermissionOrPlan() bool {
@@ -100,8 +114,16 @@ func sanitizeCloudflareToken(raw string) string {
 			}
 		}
 	}
+	if len(s) > 7 && strings.EqualFold(s[:7], "bearer ") {
+		s = strings.TrimSpace(s[7:])
+	}
 	s = strings.Trim(s, "\"'` \t\r\n")
-	s = strings.TrimSpace(s)
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r > 126 {
+			return -1
+		}
+		return r
+	}, s)
 	if strings.Contains(s, "${{") || strings.HasPrefix(s, "$") {
 		return ""
 	}
@@ -125,6 +147,9 @@ func NewCloudflareClient(token, zoneID string) *CloudflareClient {
 
 func isFullSeenodeServiceDomain(h string) bool {
 	h = cleanHost(h)
+	if h == "" || isSeenodeCnameAlias(h) {
+		return false
+	}
 	for _, suffix := range []string{".seenode.app", ".cloud.seenode.com", ".run-on-seenode.com"} {
 		if strings.HasSuffix(h, suffix) {
 			sub := strings.TrimSuffix(h, suffix)
@@ -153,7 +178,7 @@ func extractCommentSeenodeDomain(comment string) string {
 			rest = fields[0]
 		}
 		candidate := cleanHost(rest)
-		if isSeenodeManagedDomain(candidate) {
+		if isFullSeenodeServiceDomain(candidate) {
 			return candidate
 		}
 	}
@@ -207,7 +232,7 @@ func (c *CloudflareClient) SetSeenodeOrigin(d string) {
 		return
 	}
 	clean := cleanHost(d)
-	if !isSeenodeManagedDomain(clean) {
+	if !isSeenodePublicDomain(clean) {
 		return
 	}
 	c.mu.Lock()
@@ -381,19 +406,13 @@ func (c *CloudflareClient) discoverTopologyFromDNS(ctx context.Context, zoneID, 
 			bestSN = commentSNTarget
 		} else if isFullSeenodeServiceDomain(matchedSNTarget) {
 			bestSN = matchedSNTarget
-		} else if bestSN == "" {
-			if commentSNTarget != "" {
-				bestSN = commentSNTarget
-			} else if matchedSNTarget != "" {
-				bestSN = matchedSNTarget
-			}
 		}
 	}
 
 	if bestSN != "" && bestSN != c.seenodeOrigin {
 		c.seenodeOrigin = bestSN
 		updated = true
-		log.Printf("[Cloudflare] ✓ Auto-discovered Seenode Ingress Target from DNS: %s", bestSN)
+		log.Printf("[Cloudflare] ✓ Auto-discovered Seenode Service Domain from DNS: %s", bestSN)
 	}
 	c.mu.Unlock()
 
@@ -454,6 +473,10 @@ func (c *CloudflareClient) FetchZoneDomain(parent context.Context) (string, erro
 	if currentZoneID == "" {
 		zones, err := doCFRequest[[]cfZoneDetails](ctx, c, http.MethodGet, "/zones?status=active&per_page=50", nil)
 		if err != nil {
+			var apiErr *cfAPIError
+			if errors.As(err, &apiErr) && apiErr.IsInvalidToken() {
+				log.Printf("[Cloudflare] Hint: CLOUDFLARE_API_TOKEN (length=%d) was rejected by Cloudflare (Code 9109). Ensure you created a 'User API Token' (not Global API Key) via the CLOUDFLARE TOKEN button.", len(c.Token))
+			}
 			return "", fmt.Errorf("auto-discover zones query failed: %w", err)
 		}
 		if len(zones) == 0 {
@@ -622,10 +645,7 @@ func (c *CloudflareClient) ProvisionSeenodeDNS(ctx context.Context, info *Seenod
 	}
 
 	cnameTarget := cleanHost(info.CNAMETarget)
-	if cnameTarget == "" {
-		cnameTarget = cleanHost(c.GetSeenodeOrigin())
-	}
-	if cnameTarget == "" {
+	if cnameTarget == "" || isFullSeenodeServiceDomain(cnameTarget) {
 		cnameTarget = defaultSeenodeIngressCNAME
 	}
 
@@ -694,11 +714,6 @@ func (c *CloudflareClient) ProvisionSeenodeDNS(ctx context.Context, info *Seenod
 	var commentTag string
 	if isFullSeenodeServiceDomain(snOrigin) {
 		candidate := bermudaSNCommentPrefix + snOrigin
-		if len(candidate) <= 95 {
-			commentTag = candidate
-		}
-	} else if isFullSeenodeServiceDomain(cnameTarget) {
-		candidate := bermudaSNCommentPrefix + cnameTarget
 		if len(candidate) <= 95 {
 			commentTag = candidate
 		}
@@ -949,7 +964,7 @@ func (c *CloudflareClient) ensureDNSConfiguration(ctx context.Context, zoneID, z
 		isSeenodeTarget := isSeenodeManagedDomain(recContent) || (snOrigin != "" && recContent == snOrigin)
 
 		if isSeenodeManagedDomain(recContent) {
-			if snOrigin == "" || (!isFullSeenodeServiceDomain(snOrigin) && isFullSeenodeServiceDomain(recContent)) {
+			if (snOrigin == "" || !isFullSeenodeServiceDomain(snOrigin)) && isFullSeenodeServiceDomain(recContent) {
 				snOrigin = recContent
 				c.SetSeenodeOrigin(recContent)
 				topologyChanged = true
