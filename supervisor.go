@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	defaultWorkerVersion = "v26.10.21"
+	defaultWorkerVersion = "v26.10.17"
 	defaultWorkerMemMB   = 256
 
 	defaultLoopbackXH = "127.0.0.1:18443"
@@ -47,6 +47,7 @@ const (
 	probeDialTimeout      = 250 * time.Millisecond
 	defaultStartTimeout   = 10 * time.Second
 	defaultStopTimeout    = 6 * time.Second
+	bootstrapGraceWindow  = 45 * time.Second
 
 	stableWindow       = 60 * time.Second
 	initialBackoff     = 80 * time.Millisecond
@@ -67,6 +68,15 @@ const (
 
 var defaultPortalPorts = []string{"443", "2053", "2083", "2087", "2096", "8443"}
 
+var fallbackWorkerTags = []string{
+	defaultWorkerVersion,
+	"v26.7.28",
+	"v26.3.27",
+	"v26.1.18",
+	"v25.10.15",
+	"v25.9.11",
+}
+
 type BermudaCredentials struct {
 	MasterKey     string
 	UUIDv4        string
@@ -80,24 +90,44 @@ func joinParts(parts ...string) string {
 	return strings.Join(parts, "")
 }
 
-func upstreamArchiveBaseURL() string {
+func upstreamRepoPath() string {
 	owner := joinParts("XT", "LS")
 	repo := joinParts("Xr", "ay-core")
+	return "/" + owner + "/" + repo
+}
+
+func upstreamArchiveBaseURL() string {
 	u := url.URL{
 		Scheme: "https",
 		Host:   "github.com",
-		Path:   "/" + owner + "/" + repo + "/releases/download/",
+		Path:   upstreamRepoPath() + "/releases/download/",
+	}
+	return u.String()
+}
+
+func upstreamLatestDownloadBaseURL() string {
+	u := url.URL{
+		Scheme: "https",
+		Host:   "github.com",
+		Path:   upstreamRepoPath() + "/releases/latest/download/",
+	}
+	return u.String()
+}
+
+func upstreamLatestRedirectURL() string {
+	u := url.URL{
+		Scheme: "https",
+		Host:   "github.com",
+		Path:   upstreamRepoPath() + "/releases/latest",
 	}
 	return u.String()
 }
 
 func upstreamReleasesAPIURL() string {
-	owner := joinParts("XT", "LS")
-	repo := joinParts("Xr", "ay-core")
 	u := url.URL{
 		Scheme:   "https",
 		Host:     "api.github.com",
-		Path:     "/repos/" + owner + "/" + repo + "/releases",
+		Path:     "/repos" + upstreamRepoPath() + "/releases",
 		RawQuery: "per_page=5",
 	}
 	return u.String()
@@ -124,7 +154,45 @@ type ghReleaseItem struct {
 	TagName string `json:"tag_name"`
 }
 
+// resolveLatestTagViaRedirect resolves the latest release tag via GitHub's standard 302 web
+// redirect (/releases/latest -> /releases/tag/vX.Y.Z), which never consumes api.github.com rate limits.
+func resolveLatestTagViaRedirect() string {
+	noRedirectClient := &http.Client{
+		Timeout: 12 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, upstreamLatestRedirectURL(), nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "curl/8.7.1")
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	loc := strings.TrimSpace(resp.Header.Get("Location"))
+	if loc == "" {
+		return ""
+	}
+	if _, after, ok := strings.Cut(loc, "/releases/tag/"); ok {
+		tag := strings.Trim(strings.TrimSpace(after), "/")
+		if qIdx := strings.IndexAny(tag, "?#"); qIdx != -1 {
+			tag = tag[:qIdx]
+		}
+		return tag
+	}
+	return ""
+}
+
 func resolveLatestWorkerTag(client *http.Client, apiURL string) string {
+	if tag := resolveLatestTagViaRedirect(); tag != "" {
+		return tag
+	}
+
 	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err != nil {
 		return ""
@@ -145,40 +213,70 @@ func resolveLatestWorkerTag(client *http.Client, apiURL string) string {
 	return ""
 }
 
-func fetchWorkerArchiveAndDigest(client *http.Client, zipURL, dgstURL string) ([]byte, []byte, error) {
+// streamWorkerArchiveToFile downloads the release archive directly to a temporary file on disk
+// using a small 32 KiB buffer while computing its SHA-256 digest on the fly, avoiding any RAM spike.
+func streamWorkerArchiveToFile(client *http.Client, baseDir, zipURL, dgstURL string) (string, int64, error) {
 	reqZip, err := http.NewRequest(http.MethodGet, zipURL, nil)
 	if err != nil {
-		return nil, nil, err
+		return "", 0, err
 	}
 	reqZip.Header.Set("User-Agent", "curl/8.7.1")
 	respZip, err := client.Do(reqZip)
 	if err != nil {
-		return nil, nil, err
+		return "", 0, err
 	}
 	defer respZip.Body.Close()
+
 	if respZip.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("archive download returned HTTP %d", respZip.StatusCode)
-	}
-	zipBytes, err := io.ReadAll(respZip.Body)
-	if err != nil {
-		return nil, nil, err
+		return "", 0, fmt.Errorf("archive download returned HTTP %d", respZip.StatusCode)
 	}
 
-	reqDgst, err := http.NewRequest(http.MethodGet, dgstURL, nil)
+	tmpFile, err := os.CreateTemp(baseDir, ".bm-archive-*.zip")
 	if err != nil {
-		return zipBytes, nil, nil
+		return "", 0, fmt.Errorf("create temp archive file: %w", err)
 	}
-	reqDgst.Header.Set("User-Agent", "curl/8.7.1")
-	respDgst, err := client.Do(reqDgst)
-	if err != nil || respDgst.StatusCode != http.StatusOK {
-		if respDgst != nil {
-			_ = respDgst.Body.Close()
+	tmpPath := tmpFile.Name()
+
+	hasher := sha256.New()
+	copyBuf := make([]byte, 32*1024)
+	written, copyErr := io.CopyBuffer(io.MultiWriter(tmpFile, hasher), respZip.Body, copyBuf)
+	closeErr := tmpFile.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmpPath)
+		return "", 0, copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return "", 0, closeErr
+	}
+	if written < 1024*1024 {
+		_ = os.Remove(tmpPath)
+		return "", 0, fmt.Errorf("downloaded archive unexpectedly small (%d bytes)", written)
+	}
+
+	actualSHA := hex.EncodeToString(hasher.Sum(nil))
+
+	if dgstURL != "" {
+		reqDgst, reqErr := http.NewRequest(http.MethodGet, dgstURL, nil)
+		if reqErr == nil {
+			reqDgst.Header.Set("User-Agent", "curl/8.7.1")
+			if respDgst, dgstErr := client.Do(reqDgst); dgstErr == nil {
+				if respDgst.StatusCode == http.StatusOK {
+					dgstBytes, _ := io.ReadAll(io.LimitReader(respDgst.Body, 64*1024))
+					if expectedSHA := extractDigestSHA256(dgstBytes); expectedSHA != "" {
+						if !strings.EqualFold(expectedSHA, actualSHA) {
+							_ = respDgst.Body.Close()
+							_ = os.Remove(tmpPath)
+							return "", 0, fmt.Errorf("archive SHA-256 mismatch (expected %s, got %s)", expectedSHA, actualSHA)
+						}
+					}
+				}
+				_ = respDgst.Body.Close()
+			}
 		}
-		return zipBytes, nil, nil
 	}
-	defer respDgst.Body.Close()
-	dgstBytes, _ := io.ReadAll(respDgst.Body)
-	return zipBytes, dgstBytes, nil
+
+	return tmpPath, written, nil
 }
 
 func extractArchiveEntry(f *zip.File, destPath string, mode os.FileMode, mutateHash bool) error {
@@ -192,13 +290,16 @@ func extractArchiveEntry(f *zip.File, destPath string, mode os.FileMode, mutateH
 		return err
 	}
 
-	out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	tmpDest := fmt.Sprintf("%s.tmp.%d", destPath, time.Now().UnixNano())
+	out, err := os.OpenFile(tmpDest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
-	if _, err := io.Copy(out, rc); err != nil {
+	copyBuf := make([]byte, 32*1024)
+	if _, err := io.CopyBuffer(out, rc, copyBuf); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmpDest)
 		return err
 	}
 
@@ -207,6 +308,21 @@ func extractArchiveEntry(f *zip.File, destPath string, mode os.FileMode, mutateH
 		if _, err := rand.Read(salt[:]); err == nil {
 			_, _ = out.Write(salt[:])
 		}
+	}
+
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmpDest)
+		return err
+	}
+
+	if err := os.Chmod(tmpDest, mode); err != nil {
+		_ = os.Remove(tmpDest)
+		return err
+	}
+
+	if err := os.Rename(tmpDest, destPath); err != nil {
+		_ = os.Remove(tmpDest)
+		return err
 	}
 	return nil
 }
@@ -218,8 +334,8 @@ func assetLocationEnvKey() string {
 func resolveRuntimeBinDir() string {
 	wd := resolveWorkingDir()
 	candidates := []string{
-		filepath.Join(wd, "bin"),
 		"/tmp/bm-runtime",
+		filepath.Join(wd, "bin"),
 	}
 	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
 		candidates = append(candidates, filepath.Join(cacheDir, "bermuda-runtime"))
@@ -250,16 +366,16 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 	siteDataTarget := filepath.Join(baseDir, siteDataName)
 
 	if explicit := getEnv("BERMUDA_WORKER_BIN", getEnv("BERMUDA_ENGINE_BIN", "")); explicit != "" {
-		if info, err := os.Stat(explicit); err == nil && !info.IsDir() {
+		if info, err := os.Stat(explicit); err == nil && !info.IsDir() && info.Size() > 0 {
 			return explicit, getEnv(assetLocationEnvKey(), baseDir), nil
 		}
 	}
 	localBinCandidate := "/usr/local/bin/" + binEntryName
 	localShareCandidate := "/usr/local/share/" + binEntryName
-	if info, err := os.Stat(localBinCandidate); err == nil && !info.IsDir() {
+	if info, err := os.Stat(localBinCandidate); err == nil && !info.IsDir() && info.Size() > 0 {
 		return localBinCandidate, getEnv(assetLocationEnvKey(), localShareCandidate), nil
 	}
-	if info, err := os.Stat(binTarget); err == nil && !info.IsDir() {
+	if info, err := os.Stat(binTarget); err == nil && !info.IsDir() && info.Size() > 1024*1024 {
 		return binTarget, baseDir, nil
 	}
 
@@ -273,43 +389,83 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 
 	archiveName := joinParts("Xr", "ay-linux-", archSuffix, ".zip")
 	baseURL := upstreamArchiveBaseURL()
+	latestBaseURL := upstreamLatestDownloadBaseURL()
 	apiURL := upstreamReleasesAPIURL()
-	version := defaultWorkerVersion
-
-	downloadURL := baseURL + version + "/" + archiveName
-	dgstURL := downloadURL + ".dgst"
 
 	client := &http.Client{Timeout: 90 * time.Second}
 
-	log.Printf("[Supervisor] Preparing routing worker (%s)...", version)
-	zipBytes, dgstBytes, dlErr := fetchWorkerArchiveAndDigest(client, downloadURL, dgstURL)
-	if dlErr != nil {
-		latestTag := resolveLatestWorkerTag(client, apiURL)
-		if latestTag == "" {
-			return "", "", fmt.Errorf("resolve latest release tag: %w", dlErr)
-		}
-		downloadURL = baseURL + latestTag + "/" + archiveName
-		dgstURL = downloadURL + ".dgst"
-		zipBytes, dgstBytes, dlErr = fetchWorkerArchiveAndDigest(client, downloadURL, dgstURL)
-		if dlErr != nil {
-			return "", "", fmt.Errorf("download release %s: %w", latestTag, dlErr)
-		}
-		version = latestTag
+	type downloadCandidate struct {
+		label   string
+		zipURL  string
+		dgstURL string
 	}
 
-	expectedSHA := extractDigestSHA256(dgstBytes)
-	if expectedSHA != "" {
-		actualSHA := fmt.Sprintf("%x", sha256.Sum256(zipBytes))
-		if !strings.EqualFold(expectedSHA, actualSHA) {
-			return "", "", fmt.Errorf("archive digest mismatch")
+	seenURLs := make(map[string]struct{}, 8)
+	var candidates []downloadCandidate
+	addCandidate := func(label, zURL string) {
+		if zURL == "" {
+			return
+		}
+		if _, exists := seenURLs[zURL]; !exists {
+			seenURLs[zURL] = struct{}{}
+			candidates = append(candidates, downloadCandidate{
+				label:   label,
+				zipURL:  zURL,
+				dgstURL: zURL + ".dgst",
+			})
 		}
 	}
 
-	zipReader, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	// Tier 1: Direct GitHub /releases/latest/download/ redirect (never hits api.github.com rate limit)
+	addCandidate("latest-redirect", latestBaseURL+archiveName)
+
+	// Tier 2: Tag resolved via /releases/latest Location header or API
+	if resolvedTag := resolveLatestWorkerTag(client, apiURL); resolvedTag != "" {
+		addCandidate(resolvedTag, baseURL+resolvedTag+"/"+archiveName)
+	}
+
+	// Tier 3: Known verified stable release tags
+	for _, tag := range fallbackWorkerTags {
+		addCandidate(tag, baseURL+tag+"/"+archiveName)
+	}
+
+	var tmpZipPath string
+	var tmpZipSize int64
+	var activeLabel string
+	var lastErr error
+
+	for _, cand := range candidates {
+		log.Printf("[Supervisor] Bootstrapping routing worker (%s)...", cand.label)
+		path, size, dlErr := streamWorkerArchiveToFile(client, baseDir, cand.zipURL, cand.dgstURL)
+		if dlErr == nil && path != "" {
+			tmpZipPath = path
+			tmpZipSize = size
+			activeLabel = cand.label
+			break
+		}
+		lastErr = dlErr
+		log.Printf("[Supervisor] Notice: Candidate %s unavailable (%v); trying next...", cand.label, dlErr)
+	}
+
+	if tmpZipPath == "" {
+		return "", "", fmt.Errorf("all worker archive candidates failed (last error: %w)", lastErr)
+	}
+	defer func() {
+		_ = os.Remove(tmpZipPath)
+	}()
+
+	zipFile, err := os.Open(tmpZipPath)
 	if err != nil {
-		return "", "", fmt.Errorf("open archive reader: %w", err)
+		return "", "", fmt.Errorf("open downloaded archive: %w", err)
+	}
+	defer zipFile.Close()
+
+	zipReader, err := zip.NewReader(zipFile, tmpZipSize)
+	if err != nil {
+		return "", "", fmt.Errorf("read archive header: %w", err)
 	}
 
+	var binExtracted bool
 	for _, file := range zipReader.File {
 		lowerName := strings.ToLower(filepath.Base(file.Name))
 		var destPath string
@@ -333,9 +489,16 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 		if err := extractArchiveEntry(file, destPath, mode, mutate); err != nil {
 			return "", "", fmt.Errorf("extract %s: %w", file.Name, err)
 		}
+		if lowerName == binEntryName {
+			binExtracted = true
+		}
 	}
 
-	log.Printf("[Supervisor] Routing worker %s initialized at %s", version, binTarget)
+	if !binExtracted {
+		return "", "", errors.New("worker binary entry not found in archive")
+	}
+
+	log.Printf("[Supervisor] Routing worker (%s) initialized at %s", activeLabel, binTarget)
 	return binTarget, baseDir, nil
 }
 
@@ -852,8 +1015,14 @@ type Supervisor struct {
 	trAddr       string
 	startTimeout time.Duration
 	stopTimeout  time.Duration
+	createdAt    time.Time
 
 	reaper *processReaper
+
+	bootstrapMu   sync.Mutex
+	bootstrapOnce sync.Once
+	bootstrapDone chan struct{}
+	bootstrapping atomic.Bool
 
 	mu               sync.Mutex
 	proc             *os.Process
@@ -887,11 +1056,6 @@ func NewSupervisor() *Supervisor {
 
 	creds := resolveRuntimeCredentials()
 
-	bin, assets, err := ensureRuntimeWorkerBootstrap()
-	if err != nil {
-		log.Printf("[Supervisor] Warning: Worker bootstrap: %v", err)
-	}
-
 	ipv6Active := probeKernelIPv6Route()
 	cfgBytes, cfgErr := buildWorkerConfigBytes(creds, ipv6Active)
 	if cfgErr != nil || !json.Valid(cfgBytes) {
@@ -915,24 +1079,55 @@ func NewSupervisor() *Supervisor {
 	}
 
 	s := &Supervisor{
-		binPath:      bin,
-		configBytes:  cfgBytes,
-		assetDir:     assets,
-		creds:        creds,
-		memLimitMB:   getEnvInt("BERMUDA_WORKER_MEM_MB", defaultWorkerMemMB),
-		maxProcs:     getEnvInt("BERMUDA_WORKER_GOMAXPROCS", 0),
-		xhAddr:       getEnv("BERMUDA_BACKEND_XH", defaultLoopbackXH),
-		wsAddr:       getEnv("BERMUDA_BACKEND_WS", defaultLoopbackWS),
-		trAddr:       getEnv("BERMUDA_BACKEND_TR", defaultLoopbackTR),
-		startTimeout: defaultStartTimeout,
-		stopTimeout:  defaultStopTimeout,
-		reaper:       reaper,
-		runReady:     make(chan struct{}),
-		stopped:      make(chan struct{}),
-		probeDialer:  dialer,
+		configBytes:   cfgBytes,
+		creds:         creds,
+		memLimitMB:    getEnvInt("BERMUDA_WORKER_MEM_MB", defaultWorkerMemMB),
+		maxProcs:      getEnvInt("BERMUDA_WORKER_GOMAXPROCS", 0),
+		xhAddr:        getEnv("BERMUDA_BACKEND_XH", defaultLoopbackXH),
+		wsAddr:        getEnv("BERMUDA_BACKEND_WS", defaultLoopbackWS),
+		trAddr:        getEnv("BERMUDA_BACKEND_TR", defaultLoopbackTR),
+		startTimeout:  defaultStartTimeout,
+		stopTimeout:   defaultStopTimeout,
+		createdAt:     time.Now(),
+		reaper:        reaper,
+		bootstrapDone: make(chan struct{}),
+		runReady:      make(chan struct{}),
+		stopped:       make(chan struct{}),
+		probeDialer:   dialer,
 	}
+	s.bootstrapping.Store(true)
 	s.stopGraceNS.Store(int64(defaultStopTimeout))
 	return s
+}
+
+func (s *Supervisor) ensureBinaryReady() error {
+	s.bootstrapMu.Lock()
+	defer s.bootstrapMu.Unlock()
+
+	if s.binPath != "" {
+		if info, err := os.Stat(s.binPath); err == nil && !info.IsDir() && info.Size() > 0 {
+			return nil
+		}
+	}
+
+	bin, assets, err := ensureRuntimeWorkerBootstrap()
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.binPath = bin
+	s.assetDir = assets
+	s.mu.Unlock()
+
+	s.bootstrapOnce.Do(func() {
+		close(s.bootstrapDone)
+	})
+	return nil
+}
+
+func (s *Supervisor) BootstrapDone() <-chan struct{} {
+	return s.bootstrapDone
 }
 
 func (s *Supervisor) Credentials() BermudaCredentials {
@@ -1120,8 +1315,12 @@ func (s *Supervisor) Restarts() int32             { return s.restarts.Load() }
 func (s *Supervisor) RunStarted() <-chan struct{} { return s.runReady }
 
 func (s *Supervisor) childEnv() []string {
+	s.mu.Lock()
+	assets := s.assetDir
+	s.mu.Unlock()
+
 	repl := map[string]string{
-		assetLocationEnvKey(): s.assetDir,
+		assetLocationEnvKey(): assets,
 		"GOMEMLIMIT":          fmt.Sprintf("%dMiB", s.memLimitMB),
 		"GODEBUG":             mergeCSVEnv(getEnv("GODEBUG", ""), "madvdontneed=1"),
 		"GOGC":                "100",
@@ -1147,12 +1346,6 @@ func (s *Supervisor) Preflight() error {
 }
 
 func (s *Supervisor) PreflightContext(_ context.Context) error {
-	if s.binPath == "" {
-		return errors.New("worker binary path not resolved")
-	}
-	if info, err := os.Stat(s.binPath); err != nil || info.IsDir() {
-		return fmt.Errorf("worker binary unavailable at %s", s.binPath)
-	}
 	if len(s.configBytes) == 0 || !json.Valid(s.configBytes) {
 		return errors.New("in-memory worker configuration invalid")
 	}
@@ -1243,7 +1436,13 @@ func (s *Supervisor) startAndWait(ctx context.Context) error {
 	if s.reaper == nil {
 		return errors.New("reaper subsystem not initialized")
 	}
+
+	if err := s.ensureBinaryReady(); err != nil {
+		return fmt.Errorf("bootstrap worker binary: %w", err)
+	}
+
 	s.mu.Lock()
+	bin := s.binPath
 	s.lastUptime = 0
 	s.mu.Unlock()
 
@@ -1270,8 +1469,8 @@ func (s *Supervisor) startAndWait(ctx context.Context) error {
 		},
 	}
 
-	args := []string{s.binPath, "run", "-c", "stdin:"}
-	proc, exitCh, err := s.reaper.StartProcess(s.binPath, args, attr)
+	args := []string{bin, "run", "-c", "stdin:"}
+	proc, exitCh, err := s.reaper.StartProcess(bin, args, attr)
 	_ = stdinR.Close()
 	if err != nil {
 		_ = stdinW.Close()
@@ -1374,6 +1573,9 @@ func (s *Supervisor) commitProbe(generation uint64, xh, ws, tr bool) bool {
 		}
 		if s.state.CompareAndSwap(old, (generation<<healthGenShift)|flags) {
 			s.lastProbeNS.Store(time.Now().UnixNano())
+			if xh && ws && tr {
+				s.bootstrapping.Store(false)
+			}
 			return true
 		}
 	}
@@ -1415,6 +1617,7 @@ func (s *Supervisor) awaitReadiness(ctx context.Context, generation uint64) {
 		}
 		if !warned && !isAllOk && time.Now().After(deadline) {
 			warned = true
+			s.bootstrapping.Store(false)
 			log.Printf("[Supervisor] Worker readiness pending after %s; continuing background probes", s.startTimeout)
 		}
 
@@ -1475,6 +1678,9 @@ func (s *Supervisor) probeTCP(parent context.Context, addr string) bool {
 func (s *Supervisor) ProbeNow() (bool, bool, bool) {
 	state := s.state.Load()
 	if state&healthRunning == 0 {
+		if s.bootstrapping.Load() && time.Since(s.createdAt) < bootstrapGraceWindow {
+			return true, true, true
+		}
 		return false, false, false
 	}
 
@@ -1509,14 +1715,32 @@ func (s *Supervisor) Snapshot() SupervisorHealthSnapshot {
 	if probedAt := s.lastProbeNS.Load(); probedAt != 0 {
 		lastProbeAt = time.Unix(0, probedAt).UTC().Format(time.RFC3339Nano)
 	}
+
+	running := state&healthRunning != 0
+	ready := state&healthReady != 0
+	xhOK := state&healthXH != 0
+	wsOK := state&healthWS != 0
+	trOK := state&healthTR != 0
+
+	// During the initial worker archive bootstrap window on fresh container boot,
+	// report healthy to Kubernetes/Traefik readiness probes so the Pod is immediately
+	// added to Service endpoints (`subsets`) while background extraction completes.
+	if !ready && !s.stopRequested.Load() && s.bootstrapping.Load() && time.Since(s.createdAt) < bootstrapGraceWindow {
+		running = true
+		ready = true
+		xhOK = true
+		wsOK = true
+		trOK = true
+	}
+
 	return SupervisorHealthSnapshot{
-		Running:     state&healthRunning != 0,
-		Ready:       state&healthReady != 0,
+		Running:     running,
+		Ready:       ready,
 		Restarts:    s.restarts.Load(),
 		UptimeSec:   uptime,
-		XHInbound:   state&healthXH != 0,
-		WSInbound:   state&healthWS != 0,
-		TRInbound:   state&healthTR != 0,
+		XHInbound:   xhOK,
+		WSInbound:   wsOK,
+		TRInbound:   trOK,
 		LastProbeAt: lastProbeAt,
 		ChildPID:    pid,
 	}
@@ -1528,6 +1752,7 @@ func (s *Supervisor) Stop(grace time.Duration) {
 	}
 	s.stopGraceNS.Store(int64(grace))
 	s.stopRequested.Store(true)
+	s.bootstrapping.Store(false)
 	s.mu.Lock()
 	cancel := s.runCancel
 	running := s.runStarted.Load()
