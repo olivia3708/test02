@@ -29,7 +29,7 @@ const (
 	edgeKeepAlivePeriod       = 15 * time.Second
 	drainPropagationWindow    = 450 * time.Millisecond
 	startupOrchestrationDelay = 4 * time.Second
-	dnsPropagationSettleDelay = 4 * time.Second
+	dnsPropagationSettleDelay = 5 * time.Second
 	tcpUserTimeoutOpt         = 18
 )
 
@@ -57,7 +57,6 @@ func cgroupMemoryLimit() (uint64, bool) {
 }
 
 func deriveMemoryBudget() (gwMB, workerMB int) {
-	// Safe defaults calibrated for Seenode's 0.5 GB (512 MiB) Basic/Trial tier
 	gwMB, workerMB = fallbackSelfMemMB, fallbackWorkerMemMB
 	limit, limited := cgroupMemoryLimit()
 	if limited {
@@ -65,7 +64,6 @@ func deriveMemoryBudget() (gwMB, workerMB int) {
 		gwMB = totalMB * gatewayMemPercent / 100
 		workerMB = totalMB * workerMemPercent / 100
 
-		// Cap combined soft ceiling at <= 68% of container RAM to prevent OOM-Kill (Exit 137)
 		allowedMB := totalMB * 68 / 100
 		if gwMB < 48 {
 			gwMB = 48
@@ -170,9 +168,6 @@ func cleanHost(h string) string {
 	return strings.ToLower(strings.TrimSpace(h))
 }
 
-// isSeenodeCnameAlias distinguishes Seenode cluster load-balancer CNAME targets
-// (such as "up-de-fra1-k8s-1.apps.run-on-seenode.com" or "de-fra1-1.ingress.seenode.app")
-// from an application's own public service domain (such as "test02.seenode.app").
 func isSeenodeCnameAlias(h string) bool {
 	h = cleanHost(h)
 	if h == "" {
@@ -258,6 +253,17 @@ func resolveInfrastructureDomains() (seenodeDomain, customDomain string) {
 	}
 
 	return seenodeDomain, customDomain
+}
+
+func customDomainHasPublicDNS(ctx context.Context, domain string) bool {
+	clean := cleanHost(domain)
+	if clean == "" {
+		return false
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupHost(lookupCtx, clean)
+	return err == nil && len(addrs) > 0
 }
 
 func orchestrateCloudInfrastructure(
@@ -354,9 +360,11 @@ func orchestrateCloudInfrastructure(
 		}
 	}
 
+	var cfZoneValid bool
 	if cf != nil && cf.Token != "" {
 		probeCtx, probeCancel := context.WithTimeout(ctx, 12*time.Second)
 		if cfDom, err := cf.FetchZoneDomain(probeCtx); err == nil && cfDom != "" {
+			cfZoneValid = true
 			syncDomains(cf.GetSeenodeOrigin(), cfDom)
 		} else if err != nil {
 			log.Printf("[Cloudflare] Notice: Zone domain discovery: %v", err)
@@ -364,8 +372,6 @@ func orchestrateCloudInfrastructure(
 		probeCancel()
 	}
 
-	// Immediately log the synchronized BMB1 bundle as soon as Seenode/Cloudflare domains are discovered,
-	// so the operator never has to wait for custom-domain ACME TLS polling to copy the complete bundle.
 	if topologyUpdated && ctx.Err() == nil {
 		log.Printf("[Runtime] Synchronized Topology: SeenodeDomain=%q | CloudflareDomain=%q | Region=%q",
 			seenodeDomain, customDomain, region)
@@ -377,33 +383,26 @@ func orchestrateCloudInfrastructure(
 	var cnameRecordID string
 	var cfDNSProvisioned bool
 
+	// DNS-First Provisioning Guard:
+	// Provision the Cloudflare CNAME record (Grey Cloud) BEFORE registering the custom domain
+	// on Seenode so that Seenode's Let's Encrypt SAN certificate never gets blocked by NXDOMAIN.
 	if customDomain != "" && (sn != nil || seenodeDomain != "") {
-		if sn != nil && sn.IsConfigured() {
-			info, err := sn.EnsureCustomDomain(ctx, customDomain)
-			if err != nil {
-				log.Printf("[Seenode] Notice: Custom domain registration (%s): %v", customDomain, err)
-			} else if info != nil {
-				customDomInfo = info
-				syncDomains(sn.GetServiceDomain(), info.Domain)
-			}
+		alreadyValidTLS := probeCustomDomainTLS(ctx, customDomain, defaultSeenodeIngressCNAME)
+		certState := "PENDING_TLS"
+		if alreadyValidTLS {
+			certState = "VALID"
 		}
-		if customDomInfo == nil && seenodeDomain != "" {
-			certState := "PENDING_TLS"
-			isValid := probeCustomDomainTLS(ctx, customDomain, defaultSeenodeIngressCNAME)
-			if isValid {
-				certState = "VALID"
-			}
-			customDomInfo = &SeenodeCustomDomainInfo{
-				Domain:            customDomain,
-				CNAMETarget:       defaultSeenodeIngressCNAME,
-				CertificateStatus: certState,
-				SSLReady:          isValid,
-				RouteReady:        isValid,
-				Ready:             isValid,
-			}
+		preInfo := &SeenodeCustomDomainInfo{
+			Domain:            customDomain,
+			CNAMETarget:       defaultSeenodeIngressCNAME,
+			CertificateStatus: certState,
+			SSLReady:          alreadyValidTLS,
+			RouteReady:        alreadyValidTLS,
+			Ready:             alreadyValidTLS,
 		}
-		if customDomInfo != nil && cf != nil && cf.Token != "" {
-			recID, dnsErr := cf.ProvisionSeenodeDNS(ctx, customDomInfo)
+
+		if cf != nil && cf.Token != "" && cfZoneValid {
+			recID, dnsErr := cf.ProvisionSeenodeDNS(ctx, preInfo)
 			if dnsErr != nil {
 				log.Printf("[Cloudflare] Warning: Automated Seenode DNS provisioning: %v", dnsErr)
 			} else {
@@ -412,15 +411,38 @@ func orchestrateCloudInfrastructure(
 				_ = sleepContext(ctx, dnsPropagationSettleDelay)
 			}
 		}
+
+		dnsResolvable := cfDNSProvisioned || customDomainHasPublicDNS(ctx, customDomain)
+		if sn != nil && sn.IsConfigured() {
+			if dnsResolvable {
+				info, err := sn.EnsureCustomDomain(ctx, customDomain)
+				if err != nil {
+					log.Printf("[Seenode] Notice: Custom domain registration (%s): %v", customDomain, err)
+				} else if info != nil {
+					customDomInfo = info
+					syncDomains(sn.GetServiceDomain(), info.Domain)
+					if cfDNSProvisioned && info.CNAMETarget != "" && !strings.EqualFold(info.CNAMETarget, preInfo.CNAMETarget) {
+						if recID, dnsErr := cf.ProvisionSeenodeDNS(ctx, info); dnsErr == nil {
+							cnameRecordID = recID
+						}
+					}
+				}
+			} else {
+				log.Printf("[Seenode] Notice: Skipping Seenode custom domain attachment for %s until DNS CNAME record is active (prevents blocking platform TLS secret)", customDomain)
+			}
+		}
+		if customDomInfo == nil && dnsResolvable {
+			customDomInfo = preInfo
+		}
 	}
 
-	if cf != nil && cf.Token != "" && ctx.Err() == nil {
+	if cf != nil && cf.Token != "" && cfZoneValid && ctx.Err() == nil {
 		cf.Tune(ctx)
 		syncDomains(cf.GetSeenodeOrigin(), cf.CachedZoneDomain())
 	}
 
 	autoOrange := !strings.EqualFold(getEnv("BERMUDA_CF_AUTO_ORANGE", "true"), "false")
-	if cf != nil && customDomInfo != nil && !customDomInfo.IsCertificateValid() && autoOrange && ctx.Err() == nil {
+	if cf != nil && cfZoneValid && customDomInfo != nil && !customDomInfo.IsCertificateValid() && autoOrange && ctx.Err() == nil {
 		if cfDNSProvisioned || customDomInfo.RecordsVerified {
 			log.Printf("[Seenode] Waiting for Let's Encrypt TLS & Route readiness on %s before enabling Cloudflare Orange Cloud...", customDomInfo.Domain)
 			if sn != nil && sn.IsConfigured() {
@@ -612,8 +634,6 @@ func main() {
 	rawRegion := getEnv("BERMUDA_REGION", getEnv("SEENODE_REGION", getEnv("REGION", "")))
 	region := normalizeRegion(rawRegion)
 
-	// NewSupervisor initializes credentials, in-memory config, and subreaper in <1ms without
-	// blocking on network I/O, allowing HTTP listeners to bind immediately on container boot.
 	sup := NewSupervisor()
 
 	cfToken := sanitizeCloudflareToken(getEnv("CLOUDFLARE_API_TOKEN", getEnv("BERMUDA_CF_API_TOKEN", "")))
@@ -697,8 +717,6 @@ func main() {
 		},
 	}
 
-	// Bind HTTP listeners FIRST before starting worker bootstrap so Kubernetes/Traefik
-	// immediately registers the Pod endpoint in `customers/web-*-service` subsets.
 	listeners, boundAddrs, err := bindDualListeners(&listenCfg, port)
 	if err != nil {
 		log.Fatalf("[Gateway] Fatal: Cannot bind HTTP listener on :%s: %v", port, err)
@@ -726,7 +744,6 @@ func main() {
 		supErrCh <- sup.Run(supCtx)
 	}()
 
-	// Apply tight gateway memory ceiling after initial worker bootstrap finishes
 	go func() {
 		select {
 		case <-sup.BootstrapDone():
