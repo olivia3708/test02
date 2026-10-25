@@ -167,13 +167,29 @@ func cleanHost(h string) string {
 	return strings.ToLower(strings.TrimSpace(h))
 }
 
-func isSeenodeManagedDomain(h string) bool {
+// isSeenodeCnameAlias distinguishes Seenode cluster load-balancer CNAME targets
+// (such as "up-de-fra1-k8s-1.apps.run-on-seenode.com" or "de-fra1-1.ingress.seenode.app")
+// from an application's own public service domain (such as "test02.seenode.app").
+func isSeenodeCnameAlias(h string) bool {
+	h = cleanHost(h)
 	if h == "" {
 		return false
 	}
-	return strings.Contains(h, "seenode.app") ||
-		strings.Contains(h, "seenode.com") ||
+	return strings.Contains(h, ".apps.run-on-seenode.com") ||
+		strings.Contains(h, ".ingress.seenode.") ||
+		strings.Contains(h, ".prod.seenode.com") ||
 		strings.Contains(h, "upcloudlb.com") ||
+		(strings.HasPrefix(h, "up-") && strings.HasSuffix(h, ".run-on-seenode.com"))
+}
+
+func isSeenodeManagedDomain(h string) bool {
+	h = cleanHost(h)
+	if h == "" {
+		return false
+	}
+	return isSeenodeCnameAlias(h) ||
+		strings.Contains(h, "seenode.app") ||
+		strings.Contains(h, "seenode.com") ||
 		strings.HasSuffix(h, "-service") ||
 		strings.HasSuffix(h, ".cluster.local") ||
 		strings.HasSuffix(h, ".svc") ||
@@ -182,10 +198,13 @@ func isSeenodeManagedDomain(h string) bool {
 }
 
 func isSeenodePublicDomain(h string) bool {
-	return h != "" &&
-		(strings.Contains(h, "seenode.app") ||
-			strings.Contains(h, "cloud.seenode.com") ||
-			strings.Contains(h, "run-on-seenode.com")) &&
+	h = cleanHost(h)
+	if h == "" || isSeenodeCnameAlias(h) {
+		return false
+	}
+	return (strings.Contains(h, "seenode.app") ||
+		strings.Contains(h, "cloud.seenode.com") ||
+		strings.Contains(h, "run-on-seenode.com")) &&
 		!strings.HasSuffix(h, ".internal") &&
 		!strings.HasSuffix(h, ".local") &&
 		!strings.HasSuffix(h, ".cluster.local") &&
@@ -260,7 +279,17 @@ func orchestrateCloudInfrastructure(
 
 	seenodeDomain := cleanHost(initialSN)
 	customDomain := cleanHost(initialCF)
+	if curSN, curCF, _ := sup.GetInfrastructureDomains(); seenodeDomain == "" || customDomain == "" {
+		if seenodeDomain == "" && isSeenodePublicDomain(curSN) {
+			seenodeDomain = curSN
+		}
+		if customDomain == "" && curCF != "" && !isSeenodeManagedDomain(curCF) {
+			customDomain = curCF
+		}
+	}
+
 	topologyUpdated := false
+	loggedAfterDiscovery := false
 
 	syncDomains := func(newSN, newCF string) {
 		cleanSN := cleanHost(newSN)
@@ -332,8 +361,18 @@ func orchestrateCloudInfrastructure(
 		probeCancel()
 	}
 
+	// Immediately log the synchronized BMB1 bundle as soon as Seenode/Cloudflare domains are discovered,
+	// so the operator never has to wait for custom-domain ACME TLS polling to copy the complete bundle.
+	if topologyUpdated && ctx.Err() == nil {
+		log.Printf("[Runtime] Synchronized Topology: SeenodeDomain=%q | CloudflareDomain=%q | Region=%q",
+			seenodeDomain, customDomain, region)
+		sup.LogProvisioningLink("")
+		loggedAfterDiscovery = true
+	}
+
 	var customDomInfo *SeenodeCustomDomainInfo
 	var cnameRecordID string
+	var cfDNSProvisioned bool
 
 	if customDomain != "" && (sn != nil || seenodeDomain != "") {
 		if sn != nil && sn.IsConfigured() {
@@ -347,13 +386,13 @@ func orchestrateCloudInfrastructure(
 		}
 		if customDomInfo == nil && seenodeDomain != "" {
 			certState := "PENDING_TLS"
-			isValid := probeCustomDomainTLS(ctx, customDomain, seenodeDomain)
+			isValid := probeCustomDomainTLS(ctx, customDomain, defaultSeenodeIngressCNAME)
 			if isValid {
 				certState = "VALID"
 			}
 			customDomInfo = &SeenodeCustomDomainInfo{
 				Domain:            customDomain,
-				CNAMETarget:       seenodeDomain,
+				CNAMETarget:       defaultSeenodeIngressCNAME,
 				CertificateStatus: certState,
 				SSLReady:          isValid,
 				RouteReady:        isValid,
@@ -366,6 +405,7 @@ func orchestrateCloudInfrastructure(
 				log.Printf("[Cloudflare] Warning: Automated Seenode DNS provisioning: %v", dnsErr)
 			} else {
 				cnameRecordID = recID
+				cfDNSProvisioned = true
 				_ = sleepContext(ctx, dnsPropagationSettleDelay)
 			}
 		}
@@ -378,16 +418,20 @@ func orchestrateCloudInfrastructure(
 
 	autoOrange := !strings.EqualFold(getEnv("BERMUDA_CF_AUTO_ORANGE", "true"), "false")
 	if cf != nil && customDomInfo != nil && !customDomInfo.IsCertificateValid() && autoOrange && ctx.Err() == nil {
-		log.Printf("[Seenode] Waiting for Let's Encrypt TLS & Route readiness on %s before enabling Cloudflare Orange Cloud...", customDomInfo.Domain)
-		if sn != nil && sn.IsConfigured() {
-			updatedInfo, valid := sn.WaitCustomDomainCertificate(ctx, customDomInfo.ID, customDomInfo.Domain, defaultSNCertPollWait)
-			if valid && updatedInfo != nil {
-				cf.PromoteCustomDomainToOrangeCloud(ctx, updatedInfo.Domain, updatedInfo.CNAMETarget, cnameRecordID)
-			} else if ctx.Err() == nil {
-				go watchAndPromoteCustomDomain(ctx, sn, cf, customDomInfo, cnameRecordID)
+		if cfDNSProvisioned || customDomInfo.RecordsVerified {
+			log.Printf("[Seenode] Waiting for Let's Encrypt TLS & Route readiness on %s before enabling Cloudflare Orange Cloud...", customDomInfo.Domain)
+			if sn != nil && sn.IsConfigured() {
+				updatedInfo, valid := sn.WaitCustomDomainCertificate(ctx, customDomInfo.ID, customDomInfo.Domain, defaultSNCertPollWait)
+				if valid && updatedInfo != nil {
+					cf.PromoteCustomDomainToOrangeCloud(ctx, updatedInfo.Domain, updatedInfo.CNAMETarget, cnameRecordID)
+				} else if ctx.Err() == nil {
+					go watchAndPromoteCustomDomain(ctx, sn, cf, customDomInfo, cnameRecordID)
+				}
+			} else {
+				go watchAndPromoteCustomDomain(ctx, nil, cf, customDomInfo, cnameRecordID)
 			}
-		} else {
-			go watchAndPromoteCustomDomain(ctx, nil, cf, customDomInfo, cnameRecordID)
+		} else if cf.GetZoneID() != "" {
+			go watchAndPromoteCustomDomain(ctx, sn, cf, customDomInfo, cnameRecordID)
 		}
 	}
 
@@ -395,7 +439,7 @@ func orchestrateCloudInfrastructure(
 		sn.TuneComputeAndNetwork(ctx)
 	}
 
-	if ctx.Err() == nil && (topologyUpdated || sn != nil || cf != nil) {
+	if ctx.Err() == nil && !loggedAfterDiscovery && (topologyUpdated || sn != nil || cf != nil) {
 		log.Printf("[Runtime] Synchronized Topology: SeenodeDomain=%q | CloudflareDomain=%q | Region=%q",
 			seenodeDomain, customDomain, region)
 		sup.LogProvisioningLink("")
