@@ -17,11 +17,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
 	seenodeAPIBase             = "https://api.seenode.com/v1"
-	defaultSeenodeIngressCNAME = "de-fra1-1.ingress.seenode.app"
+	defaultSeenodeIngressCNAME = "up-de-fra1-k8s-1.apps.run-on-seenode.com"
+	legacySeenodeIngressCNAME  = "de-fra1-1.ingress.seenode.app"
 	defaultSNReqTimeout        = 15 * time.Second
 	defaultSNCertPollTick      = 10 * time.Second
 	defaultSNCertPollWait      = 96 * time.Second
@@ -34,6 +36,8 @@ const (
 var seenodeFallbackIngressIPs = []string{
 	"94.237.83.139",
 	"212.147.229.111",
+	"94.237.93.224",
+	"85.9.200.19",
 }
 
 // Cloudflare IPv4 CIDR ranges to prevent false-positive TLS probes against proxied records
@@ -132,6 +136,7 @@ func (info *SeenodeCustomDomainInfo) IsCertificateValid() bool {
 	}
 	st := strings.ToUpper(strings.TrimSpace(info.CertificateStatus))
 	if st == "" ||
+		strings.Contains(st, "UNKNOWN") ||
 		strings.Contains(st, "PROVISION") ||
 		strings.Contains(st, "PENDING") ||
 		strings.Contains(st, "UNVERIFIED") ||
@@ -175,8 +180,16 @@ func sanitizeSeenodeToken(raw string) string {
 			}
 		}
 	}
+	if len(s) > 7 && strings.EqualFold(s[:7], "bearer ") {
+		s = strings.TrimSpace(s[7:])
+	}
 	s = strings.Trim(s, "\"'` \t\r\n")
-	s = strings.TrimSpace(s)
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r > 126 {
+			return -1
+		}
+		return r
+	}, s)
 	if strings.Contains(s, "${{") || strings.HasPrefix(s, "$") {
 		return ""
 	}
@@ -736,10 +749,31 @@ func (c *SeenodeClient) ResolveRuntimeContext(ctx context.Context) error {
 	return nil
 }
 
+type snEnvVarItem struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+func isValidEnvVarKey(k string) bool {
+	if len(k) == 0 {
+		return false
+	}
+	first := k[0]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) {
+		return false
+	}
+	for i := 1; i < len(k); i++ {
+		ch := k[i]
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 // PersistMasterKey implements a strict Read-Before-Write Merge & Anti-Restart-Loop Guard.
-// Because updating environment variables on Seenode restarts the running container, we first
-// read existing variables via GET /applications/{id}/environment-variables and abort if
-// BERMUDA_MASTER_KEY is already present or if masked secrets would be jeopardized.
+// Seenode's PUT /applications/{id}/environment-variables endpoint validates `environmentVariables`
+// as an array of `{"key": string, "value": string}` objects where `key` matches `^[a-zA-Z][a-zA-Z0-9_]*$`.
 func (c *SeenodeClient) PersistMasterKey(ctx context.Context, masterKey string) bool {
 	if !c.IsConfigured() || strings.TrimSpace(masterKey) == "" {
 		return false
@@ -775,7 +809,7 @@ func (c *SeenodeClient) PersistMasterKey(ctx context.Context, masterKey string) 
 		return false
 	}
 
-	existingMap, hasUnrevealedSecrets, keyAlreadyExists := parseSeenodeEnvVarsResponse(raw)
+	existingItems, hasUnrevealedSecrets, keyAlreadyExists := parseSeenodeEnvVarsResponse(raw)
 	if keyAlreadyExists {
 		c.mu.Lock()
 		c.keyPersisted = true
@@ -785,17 +819,17 @@ func (c *SeenodeClient) PersistMasterKey(ctx context.Context, masterKey string) 
 	}
 
 	if hasUnrevealedSecrets {
-		log.Println("[Seenode] Notice: Masked secret variables detected in environment; skipping PUT to avoid overwriting masked secrets. Set BERMUDA_MASTER_KEY in dashboard.")
+		log.Println("[Seenode] Notice: Unrecoverable masked secret variables detected; skipping PUT to avoid overwriting secrets. Set BERMUDA_MASTER_KEY in dashboard.")
 		return false
 	}
 
-	if existingMap == nil {
-		existingMap = make(map[string]string)
-	}
-	existingMap["BERMUDA_MASTER_KEY"] = strings.TrimSpace(masterKey)
+	existingItems = append(existingItems, snEnvVarItem{
+		Key:   "BERMUDA_MASTER_KEY",
+		Value: strings.TrimSpace(masterKey),
+	})
 
 	payload := map[string]any{
-		"environmentVariables": existingMap,
+		"environmentVariables": existingItems,
 	}
 
 	if _, _, putErr := doSNRequest(ctx, c, http.MethodPut, envPath, payload); putErr != nil {
@@ -810,30 +844,48 @@ func (c *SeenodeClient) PersistMasterKey(ctx context.Context, masterKey string) 
 	return true
 }
 
-func parseSeenodeEnvVarsResponse(rawBytes []byte) (envMap map[string]string, hasMaskedSecrets bool, hasMasterKey bool) {
-	envMap = make(map[string]string)
+func parseSeenodeEnvVarsResponse(rawBytes []byte) (items []snEnvVarItem, hasMaskedSecrets bool, hasMasterKey bool) {
 	if len(rawBytes) == 0 {
-		return envMap, false, false
+		return nil, false, false
 	}
 
 	var raw any
 	if err := json.Unmarshal(rawBytes, &raw); err != nil {
-		return envMap, true, false
+		return nil, true, false
 	}
+
+	seenKeys := make(map[string]int)
 
 	inspectKey := func(k, v string, isSecret bool, isMasked bool) {
 		k = strings.TrimSpace(k)
-		if k == "" {
+		if !isValidEnvVarKey(k) {
 			return
 		}
 		if strings.EqualFold(k, "BERMUDA_MASTER_KEY") || strings.EqualFold(k, "MASTER_KEY") {
 			hasMasterKey = true
 		}
-		if (isSecret && (isMasked || v == "" || strings.Contains(v, "***") || strings.Contains(v, "•••"))) ||
-			strings.Contains(v, "********") {
-			hasMaskedSecrets = true
+
+		valMasked := isMasked ||
+			(isSecret && v == "") ||
+			strings.Contains(v, "********") ||
+			strings.Contains(v, "***") ||
+			strings.Contains(v, "•••")
+
+		if valMasked {
+			// Recover the exact unmasked secret value from the running container's own OS environment if present
+			if envVal, ok := syscall.Getenv(k); ok && strings.TrimSpace(envVal) != "" {
+				v = envVal
+			} else {
+				hasMaskedSecrets = true
+			}
 		}
-		envMap[k] = v
+
+		if idx, exists := seenKeys[k]; exists {
+			items[idx].Value = v
+		} else {
+			seenKeys[k] = len(items)
+			items = append(items, snEnvVarItem{Key: k, Value: v})
+		}
 	}
 
 	var walk func(node any)
@@ -856,10 +908,13 @@ func parseSeenodeEnvVarsResponse(rawBytes []byte) (envMap map[string]string, has
 			}
 		case map[string]any:
 			if withheld, ok := val["withheldSecretKeys"].([]any); ok && len(withheld) > 0 {
-				hasMaskedSecrets = true
 				for _, wk := range withheld {
-					if wks, ok := wk.(string); ok && (strings.EqualFold(wks, "BERMUDA_MASTER_KEY") || strings.EqualFold(wks, "MASTER_KEY")) {
-						hasMasterKey = true
+					if wks, ok := wk.(string); ok {
+						wks = strings.TrimSpace(wks)
+						if strings.EqualFold(wks, "BERMUDA_MASTER_KEY") || strings.EqualFold(wks, "MASTER_KEY") {
+							hasMasterKey = true
+						}
+						inspectKey(wks, "", true, true)
 					}
 				}
 			}
@@ -870,6 +925,9 @@ func parseSeenodeEnvVarsResponse(rawBytes []byte) (envMap map[string]string, has
 				}
 			}
 			for k, v := range val {
+				if k == "withheldSecretKeys" {
+					continue
+				}
 				if strVal, ok := v.(string); ok {
 					inspectKey(k, strVal, false, false)
 				}
@@ -878,7 +936,7 @@ func parseSeenodeEnvVarsResponse(rawBytes []byte) (envMap map[string]string, has
 	}
 
 	walk(raw)
-	return envMap, hasMaskedSecrets, hasMasterKey
+	return items, hasMaskedSecrets, hasMasterKey
 }
 
 func (c *SeenodeClient) EnsureServiceDomain(ctx context.Context) (string, error) {
@@ -992,7 +1050,7 @@ func parseDomainItemMap(m map[string]any, fallbackCNAME string) SeenodeCustomDom
 	}
 
 	if info.CNAMETarget == "" {
-		if fallbackCNAME != "" {
+		if fallbackCNAME != "" && isSeenodeCnameAlias(fallbackCNAME) {
 			info.CNAMETarget = cleanHost(fallbackCNAME)
 		} else {
 			info.CNAMETarget = defaultSeenodeIngressCNAME
@@ -1012,7 +1070,7 @@ func parseDomainItemMap(m map[string]any, fallbackCNAME string) SeenodeCustomDom
 				break
 			}
 		}
-		if info.CertificateStatus == "" {
+		if info.CertificateStatus == "" || strings.EqualFold(info.CertificateStatus, "UNKNOWN") {
 			info.CertificateStatus = "PENDING_TLS"
 		}
 	}
@@ -1075,7 +1133,7 @@ func (c *SeenodeClient) listDomainsRaw(ctx context.Context, appID string) ([]See
 	if err != nil {
 		return nil, err
 	}
-	return extractDomainsFromGenericJSON(raw, c.GetServiceDomain()), nil
+	return extractDomainsFromGenericJSON(raw, defaultSeenodeIngressCNAME), nil
 }
 
 func resolveOriginIngressIPs(ctx context.Context, gatewayHost string) []string {
@@ -1094,7 +1152,11 @@ func resolveOriginIngressIPs(ctx context.Context, gatewayHost string) []string {
 		}
 	}
 
-	candidates := []string{cleanHost(gatewayHost), defaultSeenodeIngressCNAME}
+	candidates := []string{
+		cleanHost(gatewayHost),
+		defaultSeenodeIngressCNAME,
+		legacySeenodeIngressCNAME,
+	}
 	resolver := net.DefaultResolver
 
 	for _, host := range candidates {
@@ -1213,12 +1275,8 @@ func probeCustomDomainTLS(ctx context.Context, customDomain, gatewayHost string)
 }
 
 func (c *SeenodeClient) finalizeCustomDomainInfo(ctx context.Context, info SeenodeCustomDomainInfo) *SeenodeCustomDomainInfo {
-	if info.CNAMETarget == "" {
-		if srvDom := c.GetServiceDomain(); srvDom != "" {
-			info.CNAMETarget = srvDom
-		} else {
-			info.CNAMETarget = defaultSeenodeIngressCNAME
-		}
+	if info.CNAMETarget == "" || isFullSeenodeServiceDomain(info.CNAMETarget) {
+		info.CNAMETarget = defaultSeenodeIngressCNAME
 	}
 
 	if probeCustomDomainTLS(ctx, info.Domain, info.CNAMETarget) {
@@ -1227,9 +1285,8 @@ func (c *SeenodeClient) finalizeCustomDomainInfo(ctx context.Context, info Seeno
 		info.RouteReady = true
 		info.Ready = true
 		info.RecordsVerified = true
-	} else if info.CertificateStatus == "READY" || info.CertificateStatus == "VALID" {
-		// Control plane claims ready, but direct TLS + Route Identity probe hasn't succeeded yet
-		info.CertificateStatus = "PROVISIONING"
+	} else if info.CertificateStatus == "READY" || info.CertificateStatus == "VALID" || strings.EqualFold(info.CertificateStatus, "UNKNOWN") {
+		info.CertificateStatus = "PENDING_TLS"
 	}
 
 	return &info
@@ -1287,7 +1344,7 @@ func (c *SeenodeClient) EnsureCustomDomain(ctx context.Context, targetDomain str
 		return nil, fmt.Errorf("register custom domain %s on seenode: %w", cleanTarget, postErr)
 	}
 
-	created := extractDomainsFromGenericJSON(raw, c.GetServiceDomain())
+	created := extractDomainsFromGenericJSON(raw, defaultSeenodeIngressCNAME)
 	var matched SeenodeCustomDomainInfo
 	for _, d := range created {
 		if cleanHost(d.Domain) == cleanTarget {
@@ -1301,7 +1358,7 @@ func (c *SeenodeClient) EnsureCustomDomain(ctx context.Context, targetDomain str
 		} else {
 			matched = SeenodeCustomDomainInfo{
 				Domain:            cleanTarget,
-				CNAMETarget:       c.GetServiceDomain(),
+				CNAMETarget:       defaultSeenodeIngressCNAME,
 				CertificateStatus: "PENDING_TLS",
 			}
 		}
@@ -1316,15 +1373,11 @@ func (c *SeenodeClient) EnsureCustomDomain(ctx context.Context, targetDomain str
 	return finalized, nil
 }
 
-// FetchCustomDomainStatus polls GET /applications/{id}/domains (matching Seenode's UI reloadDomains
-// action and Domains Skill contract without calling any non-existent /verify endpoint) and combines
+// FetchCustomDomainStatus polls GET /applications/{id}/domains and combines
 // control-plane readiness with our direct Origin TLS + Route Identity probe.
 func (c *SeenodeClient) FetchCustomDomainStatus(ctx context.Context, customDomainID, targetDomain string) (*SeenodeCustomDomainInfo, error) {
 	cleanTarget := cleanHost(targetDomain)
-	cnameTarget := c.GetServiceDomain()
-	if cnameTarget == "" {
-		cnameTarget = defaultSeenodeIngressCNAME
-	}
+	cnameTarget := defaultSeenodeIngressCNAME
 
 	if err := c.ResolveRuntimeContext(ctx); err == nil {
 		c.mu.RLock()
