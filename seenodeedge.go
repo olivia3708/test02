@@ -32,7 +32,6 @@ const (
 	minSNRequestInterval       = 600 * time.Millisecond
 )
 
-// Observed UpCloud Frankfurt Managed Load Balancer IPs (AS202053) for Seenode ingress fallback
 var seenodeFallbackIngressIPs = []string{
 	"94.237.83.139",
 	"212.147.229.111",
@@ -40,7 +39,6 @@ var seenodeFallbackIngressIPs = []string{
 	"85.9.200.19",
 }
 
-// Cloudflare IPv4 CIDR ranges to prevent false-positive TLS probes against proxied records
 var cloudflareIPv4CIDRs = []string{
 	"173.245.48.0/20",
 	"103.21.244.0/22",
@@ -51,6 +49,7 @@ var cloudflareIPv4CIDRs = []string{
 	"190.93.240.0/20",
 	"188.114.96.0/20",
 	"197.234.240.0/22",
+	"198.41.128.128/17",
 	"198.41.128.0/17",
 	"162.158.0.0/15",
 	"104.16.0.0/13",
@@ -820,10 +819,21 @@ func (c *SeenodeClient) PersistMasterKey(ctx context.Context, masterKey string) 
 		return false
 	}
 
-	existingItems = append(existingItems, snEnvVarItem{
-		Key:   "BERMUDA_MASTER_KEY",
-		Value: strings.TrimSpace(masterKey),
-	})
+	cleanMK := strings.TrimSpace(masterKey)
+	updatedInPlace := false
+	for i := range existingItems {
+		if strings.EqualFold(existingItems[i].Key, "BERMUDA_MASTER_KEY") {
+			existingItems[i].Value = cleanMK
+			updatedInPlace = true
+			break
+		}
+	}
+	if !updatedInPlace {
+		existingItems = append(existingItems, snEnvVarItem{
+			Key:   "BERMUDA_MASTER_KEY",
+			Value: cleanMK,
+		})
+	}
 
 	payload := map[string]any{
 		"environmentVariables": existingItems,
@@ -858,9 +868,6 @@ func parseSeenodeEnvVarsResponse(rawBytes []byte) (items []snEnvVarItem, hasMask
 		if !isValidEnvVarKey(k) {
 			return
 		}
-		if strings.EqualFold(k, "BERMUDA_MASTER_KEY") || strings.EqualFold(k, "MASTER_KEY") {
-			hasMasterKey = true
-		}
 
 		valMasked := isMasked ||
 			(isSecret && v == "") ||
@@ -874,6 +881,11 @@ func parseSeenodeEnvVarsResponse(rawBytes []byte) (items []snEnvVarItem, hasMask
 			} else {
 				hasMaskedSecrets = true
 			}
+		}
+
+		// Only treat BERMUDA_MASTER_KEY as already persisted if its value is non-empty!
+		if (strings.EqualFold(k, "BERMUDA_MASTER_KEY") || strings.EqualFold(k, "MASTER_KEY")) && strings.TrimSpace(v) != "" {
+			hasMasterKey = true
 		}
 
 		if idx, exists := seenKeys[k]; exists {
@@ -907,9 +919,6 @@ func parseSeenodeEnvVarsResponse(rawBytes []byte) (items []snEnvVarItem, hasMask
 				for _, wk := range withheld {
 					if wks, ok := wk.(string); ok {
 						wks = strings.TrimSpace(wks)
-						if strings.EqualFold(wks, "BERMUDA_MASTER_KEY") || strings.EqualFold(wks, "MASTER_KEY") {
-							hasMasterKey = true
-						}
 						inspectKey(wks, "", true, true)
 					}
 				}
